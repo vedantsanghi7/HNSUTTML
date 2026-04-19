@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HN Intel - Thread Intelligence Tool</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <div class="app">
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <span class="logo-mark">H</span>
+                    <span class="logo-text">HN Intel</span>
+                </div>
+                <button id="new-btn" class="ghost-btn" title="New topic">＋ New</button>
+            </div>
+            <div class="sidebar-section">
+                <div class="section-title">Recent topics</div>
+                <ul id="digest-list" class="digest-list"></ul>
+                <div id="digest-empty" class="empty-hint">No digests yet.<br>Run a search to get started.</div>
+            </div>
+            <div class="sidebar-footer">
+                <div class="tagline">HN threads are a graph of opinions.<br>We preserve it.</div>
+            </div>
+        </aside>
+
+        <main class="main">
+            <section id="hero" class="hero">
+                <h1>Turn any HN topic into a cited digest.</h1>
+                <p class="subtitle">Multi-axis fetch → contextual chunks → structured claims → clustered positions → grounded chat.</p>
+                <form id="search-form" class="search">
+                    <input type="text" id="topic-input" placeholder="e.g. SQLite in production" required autocomplete="off" autofocus>
+                    <button type="submit" id="analyze-btn">Analyze</button>
+                </form>
+                <div class="example-row">
+                    <span class="example-label">Try:</span>
+                    <button class="chip" data-topic="SQLite in production">SQLite in production</button>
+                    <button class="chip" data-topic="Rust vs Go for web services">Rust vs Go for web services</button>
+                    <button class="chip" data-topic="Self-hosting Postgres">Self-hosting Postgres</button>
+                </div>
+            </section>
+
+            <section id="progress-panel" class="progress-panel hidden">
+                <div class="spinner"></div>
+                <div id="progress-text">Initializing pipeline…</div>
+                <div id="expected-time" class="time-estimate"></div>
+                <ol id="progress-steps" class="progress-steps">
+                    <li data-step="fetch">Fetching threads</li>
+                    <li data-step="chunk">Generating context prefixes</li>
+                    <li data-step="embed">Embedding comments</li>
+                    <li data-step="extract">Extracting claims</li>
+                    <li data-step="cluster">Clustering positions</li>
+                    <li data-step="synthesize">Synthesizing digest</li>
+                </ol>
+            </section>
+
+            <section id="workspace" class="workspace hidden">
+                <div class="workspace-header">
+                    <div>
+                        <div class="workspace-topic" id="workspace-topic"></div>
+                        <div class="workspace-meta" id="workspace-meta"></div>
+                    </div>
+                    <div class="tabs" role="tablist">
+                        <button class="tab active" data-tab="digest" role="tab">Digest</button>
+                        <button class="tab" data-tab="chat" role="tab">Chat</button>
+                    </div>
+                </div>
+
+                <div class="tab-panel active" id="tab-digest" role="tabpanel">
+                    <article id="digest-markdown" class="markdown"></article>
+                </div>
+
+                <div class="tab-panel" id="tab-chat" role="tabpanel">
+                    <div id="chat-log" class="chat-log">
+                        <div class="chat-hint">
+                            Ask follow-ups grounded in the fetched HN threads. Try things like:
+                            <ul>
+                                <li>"What did they say about write performance?"</li>
+                                <li>"How does this compare to Postgres?"</li>
+                                <li>"Any caveats with WAL mode?"</li>
+                            </ul>
+                        </div>
+                    </div>
+                    <form id="chat-form" class="chat-form">
+                        <textarea id="chat-input" placeholder="Ask a follow-up…" rows="1" autocomplete="off"></textarea>
+                        <button type="submit" id="chat-send" aria-label="Send">↑</button>
+                    </form>
+                </div>
+            </section>
+
+            <section id="error-banner" class="error-banner hidden">
+                <div class="error-content"></div>
+                <button id="error-dismiss" class="ghost-btn">Dismiss</button>
+            </section>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
