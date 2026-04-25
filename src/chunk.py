@@ -1,7 +1,7 @@
 # context prefixes, embeddings, FTS population.
 #
 # top-level comments get a deterministic prefix. reply comments get a
-# one-sentence summary of parent+grandparent via sarvam-30b.
+# one-sentence summary of parent+grandparent via sarvam-30b (batched).
 # embeddings are bge-small-en-v1.5 (384-dim), L2-normalized, stored as float32 blobs.
 
 from __future__ import annotations
@@ -12,18 +12,23 @@ from typing import Iterable
 
 import httpx
 import numpy as np
+from pydantic import BaseModel, ValidationError
 
 from src import db
+from src.batching import BatchValidationError, run_with_split_retry
 from src.config import (
     CONTEXT_PREFIX_MAX_DEPTH,
+    EMIT_PREFIXES_BATCH_TOOL,
     MODEL_SMALL,
     P1_CONTEXT_PREFIX,
+    P1_CONTEXT_PREFIX_BATCH,
+    PREFIX_BATCH_SIZE,
     PREFIX_LLM_CAP,
     PREFIX_MIN_TEXT_LENGTH_FOR_LLM,
     PREFIX_TIMEOUT_SEC,
 )
 from src.fetch import log_error
-from src.llm import chat, extract_text
+from src.llm import chat, extract_tool_args
 
 EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBED_DIM = 384
@@ -92,56 +97,128 @@ def _parent_and_grandparent(
     return parent_text, gp_text, False
 
 
-async def _prefix_for_reply(
-    client: httpx.AsyncClient,
-    *,
-    thread_title: str,
-    parent_text: str,
-    grandparent_text: str,
-    comment_text: str,
-) -> str | None:
-    prompt = P1_CONTEXT_PREFIX.format(
-        thread_title=thread_title,
-        grandparent_text=grandparent_text or "",
-        parent_text=parent_text or "",
-        comment_text=_trim(comment_text, cap=800),
+# --- Pydantic schemas for batched prefix validation ---
+
+class _PrefixItem(BaseModel):
+    comment_id: int
+    prefix: str
+
+class _PrefixBatch(BaseModel):
+    prefixes: list[_PrefixItem]
+
+
+# --- Batched prefix generation ---
+
+
+def _build_prefix_batch_user_msg(items: list[dict]) -> str:
+    """items: each dict has keys id, thread_title, parent_text,
+    grandparent_text, comment_text."""
+    parts: list[str] = []
+    for it in items:
+        parent = (it.get("parent_text") or "").strip()
+        gp = (it.get("grandparent_text") or "").strip()
+        body = _trim(it["comment_text"], cap=800)
+        title = it["thread_title"]
+        parts.append(
+            f'<hn_comment id="{it["id"]}">\n'
+            f'Thread title: {title}\n'
+            f'Grandparent (may be empty): <gp>{gp}</gp>\n'
+            f'Parent: <p>{parent}</p>\n'
+            f'This reply: <r>{body}</r>\n'
+            f'</hn_comment>'
+        )
+    return "\n\n".join(parts)
+
+
+async def _run_prefix_batch(
+    items: list[dict], client: httpx.AsyncClient
+) -> dict[int, str]:
+    """Call the LLM for one batch of comments. Returns {comment_id: prefix}.
+    Raises BatchValidationError on any structural / id-set / truncation issue.
+    """
+    if not items:
+        return {}
+
+    # Sort by id for stable cache keys (see §3.8).
+    items = sorted(items, key=lambda x: x["id"])
+    input_ids = {it["id"] for it in items}
+
+    msg_user = _build_prefix_batch_user_msg(items)
+    messages = [
+        {"role": "system", "content": P1_CONTEXT_PREFIX_BATCH},
+        {"role": "user", "content": msg_user},
+    ]
+
+    resp = await chat(
+        messages,
+        purpose="context_prefix_batch",
+        model=MODEL_SMALL,
+        tools=[EMIT_PREFIXES_BATCH_TOOL],
+        tool_choice={"type": "function", "function": {"name": "emit_prefixes"}},
+        temperature=0.1,
+        max_tokens=4000,
+        client=client,
     )
+
+    # Truncation -> definitely incomplete.
+    finish = (resp.get("choices") or [{}])[0].get("finish_reason")
+    if finish == "length":
+        raise BatchValidationError(f"prefix batch truncated (finish=length, n={len(items)})")
+
+    args = extract_tool_args(resp, "emit_prefixes")
+    if args is None:
+        raise BatchValidationError("emit_prefixes tool call missing")
+
     try:
-        resp = await chat(
-            [{"role": "user", "content": prompt}],
-            purpose="context_prefix",
-            model=MODEL_SMALL,
-            temperature=0.1,
-            # sarvam-30b is a reasoning model so it burns tokens on hidden
-            # reasoning before emitting content. 800 was too small; 2500 is safe
-            # for a <=25-word sentence plus the reasoning preamble.
-            max_tokens=2500,
-            client=client,
+        parsed = _PrefixBatch.model_validate(args)
+    except ValidationError as e:
+        raise BatchValidationError(f"prefix schema invalid: {e}") from e
+
+    out: dict[int, str] = {}
+    for entry in parsed.prefixes:
+        if entry.comment_id not in input_ids:
+            # Hallucinated id — log and drop, but don't fail the batch yet
+            # (other ids may still be valid).
+            log_error(
+                "chunk._run_prefix_batch",
+                f"hallucinated comment_id {entry.comment_id} not in input set",
+                "",
+                inp=f"input_ids_size={len(input_ids)}",
+            )
+            continue
+        # First win on duplicates.
+        if entry.comment_id in out:
+            continue
+        prefix = entry.prefix.strip().strip('"').strip()
+        if prefix:
+            out[entry.comment_id] = prefix
+
+    # Now check the bijection. Missing ids => incomplete batch => split.
+    missing = input_ids - out.keys()
+    if missing:
+        raise BatchValidationError(
+            f"prefix batch incomplete: missing {len(missing)} of {len(input_ids)} ids"
         )
-    except Exception as exc:  # noqa: BLE001
-        log_error(
-            "chunk._prefix_for_reply",
-            f"{type(exc).__name__}: {exc}",
-            traceback.format_exc(),
-        )
-        return None
-    text = extract_text(resp)
-    if not text:
-        return None
-    # Keep first non-empty line, drop stray quoting.
-    first = text.splitlines()[0].strip().strip('"').strip()
-    return first or None
+    return out
 
 
 async def generate_prefixes(query_id: int, *, sanity_first: int = 5) -> dict:
-    # Generate context prefixes for all non-discarded comments of QUERY_ID.
-    # Performance safeguards:
-    # - Only the top PREFIX_LLM_CAP comments (ranked by depth, descendants, length)
-    # receive LLM-generated prefixes. The rest get fast deterministic ones.
-    # - LLM calls are processed in batches of _BATCH_SIZE with progress logging.
-    # - The entire step has a hard timeout of PREFIX_TIMEOUT_SEC.
+    """Generate context prefixes for all non-discarded comments of QUERY_ID
+    that don't already have one (idempotent across runs)."""
     comments, threads = _load_query_rows(query_id)
-    active = [c for c in comments.values() if not c["discarded"]]
+
+    # Skip comments that already have a prefix from a prior run.
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.id FROM comments c JOIN threads t ON t.id = c.thread_id
+            WHERE t.query_id = ? AND c.context_prefix IS NOT NULL AND c.discarded = 0
+            """,
+            (query_id,),
+        ).fetchall()
+        already = {r["id"] for r in rows}
+
+    active = [c for c in comments.values() if not c["discarded"] and c["id"] not in already]
 
     # Partition: trivial (top-level / orphan) vs deep (deterministic) vs LLM-needed
     trivial: list[tuple[int, str]] = []
@@ -226,44 +303,32 @@ async def generate_prefixes(query_id: int, *, sanity_first: int = 5) -> dict:
             """,
             (query_id,),
         ).fetchone()["n"]
-        n_active = len(active)
+        n_active = len(active) + len(already)
     return {"active": n_active, "with_prefix": n_with}
-
-
-_BATCH_SIZE = 25  # process LLM prefix calls in chunks to avoid overload
 
 
 async def _generate_prefixes_inner(
     to_call: list[dict], *, sanity_first: int = 5
 ) -> None:
-    # Run LLM prefix generation in batches with progress logging.
+    """Run batched LLM prefix generation with progress logging."""
     if not to_call:
         return
 
     async with httpx.AsyncClient() as client:
-        # Sanity batch
+        # Sanity batch (first N as one batch, printed for human review)
         if sanity_first and to_call:
             sample = to_call[:sanity_first]
             print(f"[chunk] sanity batch of {len(sample)} prefixes…")
-            sample_out = await asyncio.gather(
-                *[
-                    _prefix_for_reply(
-                        client, **{k: v for k, v in s.items() if k not in ("id", "depth", "descendant_count", "text_length")}
-                    )
-                    for s in sample
-                ]
+            sample_out = await run_with_split_retry(
+                sample,
+                item_id=lambda c: c["id"],
+                run_batch=lambda batch: _run_prefix_batch(batch, client),
+                on_single_failure=lambda c: f"Reply in thread: {c['thread_title']}",
+                label="prefix.sanity",
             )
-            for s, out in zip(sample, sample_out):
-                print(f"  c{s['id']}: {out!r}")
-            # Persist sanity
-            with db.connect() as conn:
-                conn.executemany(
-                    "UPDATE comments SET context_prefix = ? WHERE id = ?",
-                    [
-                        (out or f"Reply in thread: {s['thread_title']}", s["id"])
-                        for s, out in zip(sample, sample_out)
-                    ],
-                )
+            for s in sample:
+                print(f"  c{s['id']}: {sample_out.get(s['id'], '(fallback)')!r}")
+            _persist_prefixes(sample_out, sample)
             remaining = to_call[sanity_first:]
         else:
             remaining = to_call
@@ -272,36 +337,42 @@ async def _generate_prefixes_inner(
             return
 
         total = len(remaining)
-        print(f"[chunk] generating {total} more prefixes in batches of {_BATCH_SIZE}…")
+        n_batches = (total + PREFIX_BATCH_SIZE - 1) // PREFIX_BATCH_SIZE
+        print(f"[chunk] generating {total} prefixes across {n_batches} batches of "
+              f"up to {PREFIX_BATCH_SIZE}…")
 
-        for batch_start in range(0, total, _BATCH_SIZE):
-            batch = remaining[batch_start : batch_start + _BATCH_SIZE]
-            batch_num = batch_start // _BATCH_SIZE + 1
-            total_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
-            print(f"[chunk]   batch {batch_num}/{total_batches} ({len(batch)} comments)…")
-
-            results = await asyncio.gather(
-                *[
-                    _prefix_for_reply(
-                        client,
-                        thread_title=r["thread_title"],
-                        parent_text=r["parent_text"],
-                        grandparent_text=r["grandparent_text"],
-                        comment_text=r["comment_text"],
-                    )
-                    for r in batch
-                ]
+        # Submit all batches concurrently; LLM_CONCURRENCY semaphore in llm.py
+        # bounds parallelism.
+        batches = [
+            remaining[i : i + PREFIX_BATCH_SIZE]
+            for i in range(0, total, PREFIX_BATCH_SIZE)
+        ]
+        results_per_batch = await asyncio.gather(*[
+            run_with_split_retry(
+                b,
+                item_id=lambda c: c["id"],
+                run_batch=lambda batch, _c=client: _run_prefix_batch(batch, _c),
+                on_single_failure=lambda c: f"Reply in thread: {c['thread_title']}",
+                label=f"prefix.b{idx}",
             )
-            updates: list[tuple[str, int]] = []
-            for r, out in zip(batch, results):
-                updates.append(
-                    (out or f"Reply in thread: {r['thread_title']}", r["id"])
-                )
-            with db.connect() as conn:
-                conn.executemany(
-                    "UPDATE comments SET context_prefix = ? WHERE id = ?",
-                    updates,
-                )
+            for idx, b in enumerate(batches)
+        ])
+
+        for batch, result_dict in zip(batches, results_per_batch):
+            _persist_prefixes(result_dict, batch)
+
+
+def _persist_prefixes(result_dict: dict[int, str], batch: list[dict]) -> None:
+    """Write prefixes to DB. Items without a result get the deterministic fallback."""
+    updates = []
+    for it in batch:
+        prefix = result_dict.get(it["id"]) or f"Reply in thread: {it['thread_title']}"
+        updates.append((prefix, it["id"]))
+    with db.connect() as conn:
+        conn.executemany(
+            "UPDATE comments SET context_prefix = ? WHERE id = ?",
+            updates,
+        )
 
 
 # embeddings

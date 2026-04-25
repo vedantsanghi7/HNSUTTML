@@ -2,7 +2,7 @@
 #
 # embeds claim_text with bge-small, runs HDBSCAN on the vectors,
 # weights clusters by community signal, and gets a canonical label
-# from sarvam-30b for each cluster.
+# from sarvam-30b for each cluster (batched).
 
 from __future__ import annotations
 
@@ -14,11 +14,18 @@ from collections import Counter
 
 import httpx
 import numpy as np
+from pydantic import BaseModel, ValidationError
 
 from src import db
 from src.chunk import _embed
-from src.config import MODEL_SMALL, P3_CLUSTER_LABEL
-from src.llm import chat, extract_text
+from src.config import (
+    CLUSTER_LABEL_BATCH_SIZE,
+    EMIT_LABELS_BATCH_TOOL,
+    MODEL_SMALL,
+    P3_CLUSTER_LABEL,
+    P3_CLUSTER_LABEL_BATCH,
+)
+from src.llm import chat, extract_tool_args
 
 
 # claim embeddings
@@ -157,41 +164,73 @@ def compute_cluster_payloads(
     return payloads
 
 
-# canonical labels
+# --- Batched canonical labels ---
 
 
-async def _label_cluster(client: httpx.AsyncClient, payload: dict) -> str:
-    top3 = payload["top3"]
-    while len(top3) < 3:
-        top3 = top3 + [top3[-1]]  # pad with repeats so template has 3 slots
-    prompt = P3_CLUSTER_LABEL.format(
-        claim_1=top3[0]["claim_text"],
-        claim_2=top3[1]["claim_text"],
-        claim_3=top3[2]["claim_text"],
-    )
-    try:
-        resp = await chat(
-            [{"role": "user", "content": prompt}],
-            purpose="cluster_label",
-            model=MODEL_SMALL,
-            temperature=0.2,
-            max_tokens=2000,
-            client=client,
+class _LabelItem(BaseModel):
+    cluster_id: int
+    label: str
+
+class _LabelBatch(BaseModel):
+    labels: list[_LabelItem]
+
+
+def _build_label_batch_user_msg(payloads: list[dict], offset: int) -> str:
+    """`offset` lets us renumber clusters across batches so cluster_id is unique
+    per LLM call. Returns the user message."""
+    parts: list[str] = []
+    for i, p in enumerate(payloads):
+        cid = offset + i
+        # Reuse the top-3 highest-confidence claims as before.
+        top3 = p["top3"]
+        while len(top3) < 3:
+            top3 = top3 + [top3[-1]]
+        parts.append(
+            f'<cluster id="{cid}">\n'
+            f'1. {top3[0]["claim_text"]}\n'
+            f'2. {top3[1]["claim_text"]}\n'
+            f'3. {top3[2]["claim_text"]}\n'
+            f'</cluster>'
         )
-    except Exception:  # noqa: BLE001
-        return payload["top3"][0]["claim_text"][:160]
-    text = extract_text(resp).splitlines()
-    first = next((ln.strip().strip('"') for ln in text if ln.strip()), "")
-    return first or payload["top3"][0]["claim_text"][:160]
+    return "\n\n".join(parts)
 
 
 async def _label_all(payloads: list[dict]) -> None:
+    """Assign a one-sentence label to each cluster payload. Labels are written
+    onto each payload dict in-place under key 'label'."""
     if not payloads:
         return
+
     async with httpx.AsyncClient() as client:
-        labels = await asyncio.gather(*[_label_cluster(client, p) for p in payloads])
-    for p, lab in zip(payloads, labels):
-        p["label"] = lab
+        for batch_start in range(0, len(payloads), CLUSTER_LABEL_BATCH_SIZE):
+            batch = payloads[batch_start : batch_start + CLUSTER_LABEL_BATCH_SIZE]
+            local_ids = list(range(batch_start, batch_start + len(batch)))
+            user_msg = _build_label_batch_user_msg(batch, offset=batch_start)
+            try:
+                resp = await chat(
+                    [
+                        {"role": "system", "content": P3_CLUSTER_LABEL_BATCH},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    purpose="cluster_label_batch",
+                    model=MODEL_SMALL,
+                    tools=[EMIT_LABELS_BATCH_TOOL],
+                    tool_choice={"type": "function", "function": {"name": "emit_labels"}},
+                    temperature=0.2,
+                    max_tokens=2500,
+                    client=client,
+                )
+                args = extract_tool_args(resp, "emit_labels")
+                parsed = _LabelBatch.model_validate(args or {})
+                got = {entry.cluster_id: entry.label.strip().strip('"') for entry in parsed.labels}
+            except (ValidationError, Exception):  # noqa: BLE001
+                got = {}
+
+            for local_id, payload in zip(local_ids, batch):
+                lab = got.get(local_id)
+                if not lab:
+                    lab = payload["top3"][0]["claim_text"][:160]
+                payload["label"] = lab
 
 
 # public entry point
@@ -237,4 +276,3 @@ async def cluster_and_label_async(query_id: int) -> dict:
     await loop.run_in_executor(None, _persist)
 
     return {"clusters": len(payloads), "noise": noise}
-
